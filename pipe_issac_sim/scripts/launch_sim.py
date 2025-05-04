@@ -47,11 +47,12 @@ arm = Articulation(prim_paths_expr="/World/Arm", name="my_arm")  # create an art
 
 
 # Add storm bot
-asset_path = "/home/biorobotics/Documents/varun/arpa/pipe_issac_ws/src/pipe_issac/pipe_issac_sim/stormRunner.usd"
+asset_path = "C:/Users/biorobotics/Documents/varun/pipe_issac/pipe_issac_sim/stormy.usd"
 add_reference_to_stage(usd_path=asset_path, prim_path="/World/Storm")
 storm = Articulation(prim_paths_expr="/World/Storm", name="my_storm")
 
 
+storm.set_world_poses(positions=np.array([[0.0, -1.0, 0.0]]) / get_stage_units())
 
 # set the initial poses of the arm and the car so they don't collide BEFORE the simulation starts
 arm.set_world_poses(positions=np.array([[0.0, 1.0, 0.0]]) / get_stage_units())
