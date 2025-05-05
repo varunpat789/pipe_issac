@@ -1,101 +1,194 @@
-# Copyright (c) 2020-2024, NVIDIA CORPORATION. All rights reserved.
-#
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto. Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-#
-
 from isaacsim import SimulationApp
 
-simulation_app = SimulationApp({"headless": False})  # start the simulation app, with GUI open
+simulation_app = SimulationApp({"renderer": "RaytracedLighting", "headless": False})
 
-import sys
-
-import carb
-import numpy as np
+import omni
 from isaacsim.core.api import World
-from isaacsim.core.prims import Articulation
-from isaacsim.core.utils.stage import add_reference_to_stage, get_stage_units
-from isaacsim.core.utils.types import ArticulationAction
-from isaacsim.core.utils.viewports import set_camera_view
-from isaacsim.storage.native import get_assets_root_path
-
-# preparing the scene
-assets_root_path = get_assets_root_path()
-if assets_root_path is None:
-    carb.log_error("Could not find Isaac Sim assets folder")
-    simulation_app.close()
-    sys.exit()
-
-my_world = World(stage_units_in_meters=1.0)
-my_world.scene.add_default_ground_plane()  # add ground plane
-set_camera_view(
-    eye=[5.0, 0.0, 1.5], target=[0.00, 0.00, 1.00], camera_prim_path="/OmniverseKit_Persp"
-)  # set camera view
-
-# Add Franka
-asset_path = assets_root_path + "/Isaac/Robots/Franka/franka.usd"
-add_reference_to_stage(usd_path=asset_path, prim_path="/World/Arm")  # add robot to stage
-arm = Articulation(prim_paths_expr="/World/Arm", name="my_arm")  # create an articulation object
-
-# Add Carter
-# asset_path = assets_root_path + "/Isaac/Robots/NVIsDIA/Carter/nova_carter/nova_carter.usd"
-# add_reference_to_stage(usd_path=asset_path, prim_path="/World/Car")
-# car = Articulation(prim_paths_expr="/World/Car", name="my_car")
+from isaacsim.core.api.objects import VisualCuboid
+from isaacsim.core.utils.extensions import enable_extension
+from omni.isaac.wheeled_robots.robots import WheeledRobot
+from omni.isaac.core.utils.types import ArticulationAction
+import omni.graph.core as og
+import omni.replicator.core as rep
+from isaacsim.sensors.camera import Camera
+import omni.syntheticdata._syntheticdata as sd
 
 
-# Add storm bot
-asset_path = "C:/Users/biorobotics/Documents/varun/pipe_issac/pipe_issac_sim/stormy.usd"
-add_reference_to_stage(usd_path=asset_path, prim_path="/World/Storm")
-storm = Articulation(prim_paths_expr="/World/Storm", name="my_storm")
+enable_extension("isaacsim.ros2.bridge")
+
+simulation_app.update()
+
+import time
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64MultiArray
+import isaacsim.core.utils.numpy.rotations as rot_utils
 
 
-storm.set_world_poses(positions=np.array([[0.0, -1.0, 0.0]]) / get_stage_units())
+STORM_SIGHT_USD_PATH = "/home/biorobotics/Documents/varun/arpa/pipe_issac_ws/src/pipe_issac/pipe_issac_sim/stormRobot.usd"
 
-# set the initial poses of the arm and the car so they don't collide BEFORE the simulation starts
-arm.set_world_poses(positions=np.array([[0.0, 1.0, 0.0]]) / get_stage_units())
-# car.set_world_poses(positions=np.array([[0.0, -1.0, 0.0]]) / get_stage_units())
-# car.set_world_poses(positions=np.array([[0.0, 3.0, 0.0]]) / get_stage_units())
+class StormRunnerSim(Node):
+    def __init__(self):
+        super().__init__("storm_runner_sim")
+
+        self.timeline = omni.timeline.get_timeline_interface()
+        self.ros_world = World(stage_units_in_meters=1.0)
+        self.ros_world.scene.add_default_ground_plane()
+
+        self.storm_runner = self.ros_world.scene.add(
+            WheeledRobot(
+                prim_path="/World/Storm_Sight_Runner",
+                name="Storm_Sight_Runner",
+                wheel_dof_names=["front_left_joint","front_right_joint", "back_left_joint","back_right_joint"],
+                create_robot=True,
+                usd_path=STORM_SIGHT_USD_PATH,
+                position=np.array([0, 0.0, 0.1]),
+            )
+        )
+
+        camera = Camera(
+            prim_path="/World/Storm_Sight_Runner/storm_base/storm_sensors/intel_realsense_camera/back_camera",
+            # position=np.array([0,-0.18433,0.15774]),
+            # frequency=20,
+            resolution=(256,256),
+            # orientation=rot_utils.euler_angles_to_quats(np.array([0, 0, 0]), degrees=True),
+        )
+
+        camera.initialize()
+        simulation_app.update()
+        camera.initialize()
+       
+        self.wheel_vel_sub = self.create_subscription(Float64MultiArray, 'wheel_velocities', self.wheel_velocity_callback, 10)
+
+        camera_freq = 30
+        namespace = "/back_camera"
+
+        self.publish_camera_info(camera, namespace, camera_freq)
+        self.publish_rgb(camera, namespace, camera_freq)
+        self.publish_depth(camera, namespace, camera_freq)
+
+        self.ros_world.reset()
+
+    def wheel_velocity_callback(self, msg):
+        if self.ros_world.is_playing():
+            if len(msg.data) == 4:
+                wheel_velocities = np.array(msg.data)
+                action = ArticulationAction(joint_velocities = wheel_velocities)
+                self.storm_runner.apply_wheel_actions(action)
+                print(f"Received wheel velocities: {wheel_velocities}")
+            else:
+                print(f"Warning: Received {len(msg.data)} values, need 4")
+
+    
+    def publish_camera_info(self, camera: Camera, namespace, freq):
+        from isaacsim.ros2.bridge import read_camera_info
+
+        render_product = camera._render_product_path
+        step_size = int(60/freq)
+        topic_name = camera.name+"_camera_info"
+        queue_size = 1
+        node_namespace = namespace
+        frame_id = camera.prim_path.split("/")[-1] 
+
+        writer = rep.writers.get("ROS2PublishCameraInfo")
+        camera_info = read_camera_info(render_product_path=render_product)
+        writer.initialize(
+            frameId=frame_id,
+            nodeNamespace=node_namespace,
+            queueSize=queue_size,
+            topicName=topic_name,
+            width=camera_info["width"],
+            height=camera_info["height"],
+            projectionType=camera_info["projectionType"],
+            k=camera_info["k"].reshape([1, 9]),
+            r=camera_info["r"].reshape([1, 9]),
+            p=camera_info["p"].reshape([1, 12]),
+            physicalDistortionModel=camera_info["physicalDistortionModel"],
+            physicalDistortionCoefficients=camera_info["physicalDistortionCoefficients"],
+        )
+        writer.attach([render_product])
+
+        gate_path = omni.syntheticdata.SyntheticData._get_node_path(
+            "PostProcessDispatch" + "IsaacSimulationGate", render_product
+        )
+
+        og.Controller.attribute(gate_path + ".inputs:step").set(step_size)
+        return
+
+    def publish_rgb(self, camera: Camera, namespace, freq):
+        render_product = camera._render_product_path
+        step_size = int(60/freq)
+        topic_name = camera.name+"_rgb"
+        queue_size = 1
+        node_namespace = namespace
+        frame_id = camera.prim_path.split("/")[-1]
+
+        rv = omni.syntheticdata.SyntheticData.convert_sensor_type_to_rendervar(sd.SensorType.Rgb.name)
+        writer = rep.writers.get(rv + "ROS2PublishImage")
+        writer.initialize(
+            frameId=frame_id,
+            nodeNamespace=node_namespace,
+            queueSize=queue_size,
+            topicName=topic_name
+        )
+        writer.attach([render_product])
+
+        gate_path = omni.syntheticdata.SyntheticData._get_node_path(
+            rv + "IsaacSimulationGate", render_product
+        )
+        og.Controller.attribute(gate_path + ".inputs:step").set(step_size)
+
+        return
+
+    def publish_depth(self, camera: Camera, namespace, freq):
+        render_product = camera._render_product_path
+        step_size = int(60/freq)
+        topic_name = camera.name+"_depth"
+        queue_size = 1
+        node_namespace = namespace
+        frame_id = camera.prim_path.split("/")[-1]
+
+        rv = omni.syntheticdata.SyntheticData.convert_sensor_type_to_rendervar(
+                                sd.SensorType.DistanceToImagePlane.name
+                            )
+        writer = rep.writers.get(rv + "ROS2PublishImage")
+        writer.initialize(
+            frameId=frame_id,
+            nodeNamespace=node_namespace,
+            queueSize=queue_size,
+            topicName=topic_name
+        )
+        writer.attach([render_product])
+
+        gate_path = omni.syntheticdata.SyntheticData._get_node_path(
+            rv + "IsaacSimulationGate", render_product
+        )
+        og.Controller.attribute(gate_path + ".inputs:step").set(step_size)
+
+        return
 
 
-# initialize the world
-my_world.reset()
+    def run_simulation(self):
+        self.timeline.play()
+        reset_needed = False
+        while simulation_app.is_running():
+            self.ros_world.step(render=True)
+            rclpy.spin_once(self, timeout_sec=0.0)
+            if self.ros_world.is_stopped() and not reset_needed:
+                reset_needed = True
+            if self.ros_world.is_playing():
+                if reset_needed:
+                    self.ros_world.reset()
+                    reset_needed = False
 
-for i in range(4):
-    print("running cycle: ", i)
-    if i == 1 or i == 3:
-        print("moving")
-        # move the arm
-        arm.set_joint_positions([[-1.5, 0.0, 0.0, -1.5, 0.0, 1.5, 0.5, 0.04, 0.04]])
-        # move the car
-        # car.set_joint_velocities([[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]])
-    if i == 2:
-        print("stopping")
-        # reset the arm
-        arm.set_joint_positions([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
-        # stop the car
-        # car.set_joint_velocities([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+        # Cleanup
+        self.timeline.stop()
+        self.destroy_node()
+        simulation_app.close()
 
-try:
-    while simulation_app.is_running():
-        # Move the arm and the car
-        # self.arm.set_joint_positions([[-1.5, 0.0, 0.0, -1.5, 0.0, 1.5, 0.5, 0.04, 0.04]])
-        # self.car.set_joint_velocities([[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]])
+if __name__ == "__main__":
+    rclpy.init()
+    storm_runner_sim_node = StormRunnerSim()
+    storm_runner_sim_node.run_simulation()
 
-        # Step the simulation
-        my_world.step(render=True)
-except KeyboardInterrupt:
-    print("Simulation interrupted by user")
-finally:
-    simulation_app.close()
-    # for j in range(100):
-    #     # step the simulation, both rendering and physics
-    #     my_world.step(render=True)
-    #     # print the joint positions of the car at every physics step
-    #     if i == 3:
-    #         car_joint_positions = car.get_joint_positions()
-    #         # print("car joint positions:", car_joint_positions)
-
-# simulation_app.close()
